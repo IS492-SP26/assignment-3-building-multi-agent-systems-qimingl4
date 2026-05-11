@@ -1,6 +1,6 @@
 # A Multi-Agent Deep-Research Assistant for HCI Topics
 
-**Author:** Qiming L. (Assignment 3, Fall 2025)
+**Author:** Qiming Li (Assignment 3, Fall 2025)
 **Repository:** intelligent-grothendieck-d4ac59
 **Date:** May 2026
 
