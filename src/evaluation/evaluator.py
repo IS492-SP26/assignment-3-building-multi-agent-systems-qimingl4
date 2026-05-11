@@ -219,8 +219,9 @@ class SystemEvaluator:
         failed = [r for r in self.results if "error" in r]
 
         # Aggregate scores
-        criterion_scores = {}
-        overall_scores = []
+        criterion_scores: Dict[str, List[float]] = {}
+        perspective_scores: Dict[str, List[float]] = {}
+        overall_scores: List[float] = []
 
         for result in successful:
             evaluation = result.get("evaluation", {})
@@ -228,16 +229,27 @@ class SystemEvaluator:
 
             # Collect scores by criterion
             for criterion, score_data in evaluation.get("criterion_scores", {}).items():
-                if criterion not in criterion_scores:
-                    criterion_scores[criterion] = []
-                criterion_scores[criterion].append(score_data.get("score", 0.0))
+                criterion_scores.setdefault(criterion, []).append(
+                    score_data.get("score", 0.0)
+                )
+
+            # Collect scores by judge perspective
+            for perspective, score in evaluation.get("perspective_scores", {}).items():
+                if isinstance(score, list):
+                    score = sum(score) / len(score) if score else 0.0
+                perspective_scores.setdefault(perspective, []).append(score)
 
         # Calculate averages
         avg_overall = sum(overall_scores) / len(overall_scores) if overall_scores else 0.0
 
-        avg_criterion_scores = {}
-        for criterion, scores in criterion_scores.items():
-            avg_criterion_scores[criterion] = sum(scores) / len(scores) if scores else 0.0
+        avg_criterion_scores = {
+            criterion: (sum(scores) / len(scores) if scores else 0.0)
+            for criterion, scores in criterion_scores.items()
+        }
+        avg_perspective_scores = {
+            perspective: (sum(scores) / len(scores) if scores else 0.0)
+            for perspective, scores in perspective_scores.items()
+        }
 
         # Find best and worst
         best_result = max(successful, key=lambda r: r.get("evaluation", {}).get("overall_score", 0.0)) if successful else None
@@ -253,7 +265,8 @@ class SystemEvaluator:
             },
             "scores": {
                 "overall_average": avg_overall,
-                "by_criterion": avg_criterion_scores
+                "by_criterion": avg_criterion_scores,
+                "by_perspective": avg_perspective_scores,
             },
             "best_result": {
                 "query": best_result.get("query", "") if best_result else "",
@@ -307,6 +320,10 @@ class SystemEvaluator:
             f.write("Scores by Criterion:\n")
             for criterion, score in scores.get("by_criterion", {}).items():
                 f.write(f"  {criterion}: {score:.3f}\n")
+
+            f.write("\nScores by Judge Perspective:\n")
+            for perspective, score in scores.get("by_perspective", {}).items():
+                f.write(f"  {perspective}: {score:.3f}\n")
 
         self.logger.info(f"Summary saved to {summary_file}")
 

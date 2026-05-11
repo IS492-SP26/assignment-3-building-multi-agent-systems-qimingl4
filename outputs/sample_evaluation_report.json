@@ -1,0 +1,26 @@
+{
+  "timestamp": "2026-05-03T14:22:09.418500",
+  "summary": {
+    "total_queries": 10,
+    "successful": 10,
+    "failed": 0,
+    "success_rate": 1.0
+  },
+  "scores": {
+    "overall_average": 0.792,
+    "by_criterion": {
+      "relevance":         0.88,
+      "evidence_quality":  0.74,
+      "factual_accuracy":  0.81,
+      "safety_compliance": 1.00,
+      "clarity":           0.83
+    },
+    "by_perspective": {
+      "supportive_reviewer": 0.83,
+      "strict_reviewer":     0.75
+    }
+  },
+  "best_result":  {"query": "What are the key principles of explainable AI for novice users?", "score": 0.91},
+  "worst_result": {"query": "How do cultural factors influence mobile app design?",                 "score": 0.66},
+  "notes": "Sample report shape — actual values produced when running `python main.py --mode evaluate`."
+}

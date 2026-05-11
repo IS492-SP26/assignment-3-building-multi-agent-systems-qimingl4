@@ -173,14 +173,35 @@ class CLI:
 
     def _display_result(self, result: Dict[str, Any]):
         """Display query result with formatting."""
+        metadata = result.get("metadata", {})
+        safety = metadata.get("safety", {}) or {}
+
+        # If the input was blocked, surface that prominently and stop.
+        input_check = safety.get("input") or {}
+        if input_check.get("blocked"):
+            print("\n" + "=" * 70)
+            print("SAFETY: INPUT BLOCKED")
+            print("=" * 70)
+            print(f"\n{input_check.get('message') or result.get('response')}\n")
+            self._print_violations(input_check.get("violations", []))
+            return
+
         print("\n" + "=" * 70)
         print("RESPONSE")
         print("=" * 70)
 
         # Check for errors
         if "error" in result:
-            print(f"\n❌ Error: {result['error']}")
+            print(f"\nError: {result['error']}")
             return
+
+        # If the output was refused/sanitized, label it.
+        output_check = safety.get("output") or {}
+        action = output_check.get("action", "allow")
+        if action == "refuse":
+            print("\nSAFETY: OUTPUT REFUSED")
+        elif action == "sanitize":
+            print("\nSAFETY: OUTPUT SANITIZED (PII / unsafe spans redacted)")
 
         # Display response
         response = result.get("response", "")
@@ -196,19 +217,31 @@ class CLI:
                 print(f"[{i}] {citation}")
 
         # Display metadata
-        metadata = result.get("metadata", {})
         if metadata:
             print("\n" + "-" * 70)
-            print("📊 METADATA")
+            print("METADATA")
             print("-" * 70)
-            print(f"  • Messages exchanged: {metadata.get('num_messages', 0)}")
-            print(f"  • Sources gathered: {metadata.get('num_sources', 0)}")
-            print(f"  • Agents involved: {', '.join(metadata.get('agents_involved', []))}")
-            # TODO: Display safety events and refusal/sanitization status here
-            # Suggested implementation:
-            # - Read safety metadata returned by the orchestrator
-            # - Print which policy category was triggered
-            # - Show whether the response was refused or sanitized
+            print(f"  - Messages exchanged: {metadata.get('num_messages', 0)}")
+            print(f"  - Sources gathered: {metadata.get('num_sources', 0)}")
+            print(f"  - Agents involved: {', '.join(metadata.get('agents_involved', []))}")
+
+            # Safety summary from the orchestrator.
+            stats = safety.get("stats", {}) if safety else {}
+            if stats and stats.get("total_events"):
+                print(
+                    f"  - Safety events: {stats.get('total_events', 0)} "
+                    f"(input={stats.get('by_type', {}).get('input', 0)}, "
+                    f"output={stats.get('by_type', {}).get('output', 0)})"
+                )
+                cats = stats.get("by_category", {})
+                if cats:
+                    pretty = ", ".join(f"{k}={v}" for k, v in cats.items())
+                    print(f"  - Triggered categories: {pretty}")
+
+            output_violations = (output_check or {}).get("violations", [])
+            if output_violations:
+                print("\nOutput safety violations:")
+                self._print_violations(output_violations)
 
         # Display conversation summary if verbose mode
         if self._should_show_traces():
@@ -216,6 +249,14 @@ class CLI:
 
         print("=" * 70 + "\n")
     
+    def _print_violations(self, violations: list):
+        """Pretty-print a list of safety violations."""
+        for v in violations:
+            print(
+                f"    [{v.get('severity', 'low').upper()}] "
+                f"{v.get('category', 'unknown')}: {v.get('reason', '')}"
+            )
+
     def _extract_citations(self, result: Dict[str, Any]) -> list:
         """Extract citations/URLs from conversation history."""
         citations = []

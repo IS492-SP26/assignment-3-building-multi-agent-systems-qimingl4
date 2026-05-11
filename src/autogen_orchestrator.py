@@ -16,6 +16,7 @@ import asyncio
 from typing import Dict, Any, List, Optional
 
 from src.agents.autogen_agents import create_research_team
+from src.guardrails.safety_manager import SafetyManager
 
 
 class AutoGenOrchestrator:
@@ -36,13 +37,16 @@ class AutoGenOrchestrator:
         """
         self.config = config
         self.logger = logging.getLogger("autogen_orchestrator")
-        
+
+        # Initialize the safety manager (input + output guardrails).
+        self.safety_manager = SafetyManager(config)
+
         # Create the research team
         self.logger.info("Creating research team...")
         self.team = create_research_team(config)
-        
+
         self.logger.info("Research team created successfully")
-        
+
         # Workflow trace for debugging and UI display
         self.workflow_trace: List[Dict[str, Any]] = []
 
@@ -62,7 +66,36 @@ class AutoGenOrchestrator:
             - metadata: Additional information about the process
         """
         self.logger.info(f"Processing query: {query}")
-        
+
+        # Step 0: Input guardrail. Blocked queries never reach the team.
+        input_check = self.safety_manager.check_input_safety(query)
+        if input_check.get("blocked"):
+            self.logger.warning(
+                f"Input blocked by safety policy: "
+                f"{[v.get('category') for v in input_check.get('violations', [])]}"
+            )
+            return {
+                "query": query,
+                "response": input_check.get("message")
+                or "Your query was blocked by a safety policy.",
+                "conversation_history": [],
+                "metadata": {
+                    "safety": {
+                        "input": input_check,
+                        "output": None,
+                        "events": self.safety_manager.get_safety_events(),
+                        "stats": self.safety_manager.get_safety_stats(),
+                    },
+                    "refused": True,
+                    "num_messages": 0,
+                    "num_sources": 0,
+                    "agents_involved": [],
+                },
+            }
+
+        # Use sanitized query (e.g. with injection markers stripped) downstream.
+        safe_query = input_check.get("query", query)
+
         try:
             # Run the async query processing
             loop = asyncio.get_event_loop()
@@ -71,15 +104,41 @@ class AutoGenOrchestrator:
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as pool:
                     result = pool.submit(
-                        asyncio.run, 
-                        self._process_query_async(query, max_rounds)
+                        asyncio.run,
+                        self._process_query_async(safe_query, max_rounds)
                     ).result()
             else:
-                result = loop.run_until_complete(self._process_query_async(query, max_rounds))
-            
+                result = loop.run_until_complete(
+                    self._process_query_async(safe_query, max_rounds)
+                )
+
+            # Step N+1: Output guardrail.
+            response_text = result.get("response", "")
+            output_check = self.safety_manager.check_output_safety(
+                response_text,
+                sources=result.get("metadata", {}).get("research_findings"),
+            )
+            if output_check.get("action") in {"refuse", "sanitize"}:
+                self.logger.warning(
+                    f"Output guardrail action={output_check['action']} "
+                    f"violations={[v.get('category') for v in output_check.get('violations', [])]}"
+                )
+                result["original_response"] = response_text
+                result["response"] = output_check.get("response", response_text)
+
+            metadata = result.setdefault("metadata", {})
+            metadata["safety"] = {
+                "input": input_check,
+                "output": output_check,
+                "events": self.safety_manager.get_safety_events(),
+                "stats": self.safety_manager.get_safety_stats(),
+            }
+            metadata["refused"] = output_check.get("action") == "refuse"
+            metadata["sanitized"] = output_check.get("action") == "sanitize"
+
             self.logger.info("Query processing complete")
             return result
-            
+
         except Exception as e:
             self.logger.error(f"Error processing query: {e}", exc_info=True)
             return {
@@ -87,7 +146,15 @@ class AutoGenOrchestrator:
                 "error": str(e),
                 "response": f"An error occurred while processing your query: {str(e)}",
                 "conversation_history": [],
-                "metadata": {"error": True}
+                "metadata": {
+                    "error": True,
+                    "safety": {
+                        "input": input_check,
+                        "output": None,
+                        "events": self.safety_manager.get_safety_events(),
+                        "stats": self.safety_manager.get_safety_stats(),
+                    },
+                },
             }
     
     async def _process_query_async(self, query: str, max_rounds: int = 20) -> Dict[str, Any]:
@@ -113,27 +180,43 @@ Please work together to answer this query comprehensively:
         # Run the team
         result = await self.team.run(task=task_message)
         
-        # Extract conversation history
+        # Extract conversation history. result.messages is a list in current
+        # autogen-agentchat; use a tolerant loop that works either way.
         messages = []
-        async for message in result.messages:
-            msg_dict = {
-                "source": message.source,
-                "content": message.content if hasattr(message, 'content') else str(message),
-            }
-            messages.append(msg_dict)
+        raw_messages = getattr(result, "messages", []) or []
+        for message in raw_messages:
+            content = getattr(message, "content", None)
+            if content is None:
+                content = str(message)
+            messages.append({
+                "source": getattr(message, "source", "Unknown"),
+                "content": content,
+            })
         
-        # Extract final response
+        # Extract final response. Prefer the Writer's last synthesis (the
+        # Writer is the synthesizer); fall back to Critic, then to whatever
+        # the last message is. This keeps the *answer* in the final output
+        # rather than the Critic's review of the answer.
+        def _content_to_text(msg: Dict[str, Any]) -> str:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                # Tool-call / function-call messages: skip.
+                return ""
+            return str(content)
+
         final_response = ""
-        if messages:
-            # Get the last message from Writer or Critic
+        for source_pref in ("Writer", "Critic"):
             for msg in reversed(messages):
-                if msg.get("source") in ["Writer", "Critic"]:
-                    final_response = msg.get("content", "")
-                    break
-        
-        # If no response found, use the last message
+                if msg.get("source") == source_pref:
+                    text = _content_to_text(msg)
+                    if text:
+                        final_response = text
+                        break
+            if final_response:
+                break
+
         if not final_response and messages:
-            final_response = messages[-1].get("content", "")
+            final_response = _content_to_text(messages[-1]) or str(messages[-1])
         
         return self._extract_results(query, messages, final_response)
 

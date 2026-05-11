@@ -14,12 +14,14 @@ sys.path.insert(0, str(project_root))
 
 import streamlit as st
 import asyncio
+import json
 import yaml
 from datetime import datetime
 from typing import Dict, Any
 from dotenv import load_dotenv
 
 from src.autogen_orchestrator import AutoGenOrchestrator
+from src.evaluation.judge import LLMJudge
 
 # Load environment variables
 load_dotenv()
@@ -54,6 +56,17 @@ def initialize_session_state():
     if 'show_safety_log' not in st.session_state:
         st.session_state.show_safety_log = False
 
+    if 'run_judge' not in st.session_state:
+        st.session_state.run_judge = True
+
+    if 'judge' not in st.session_state:
+        config = load_config()
+        try:
+            st.session_state.judge = LLMJudge(config)
+        except Exception as e:
+            st.session_state.judge = None
+            st.warning(f"Judge unavailable: {e}")
+
 async def process_query(query: str) -> Dict[str, Any]:
     """
     Process a query through the orchestrator.
@@ -78,10 +91,31 @@ async def process_query(query: str) -> Dict[str, Any]:
     try:
         # Process query through AutoGen orchestrator
         result = orchestrator.process_query(query)
-        
+
         # Check for errors
         if "error" in result:
             return result
+
+        # Optional LLM-as-a-Judge scoring. Skip when the orchestrator refused
+        # or blocked the request — there is nothing meaningful to judge.
+        judge_result = None
+        result_meta = result.get("metadata", {}) or {}
+        was_refused = result_meta.get("refused") or (
+            (result_meta.get("safety", {}) or {}).get("input", {}) or {}
+        ).get("blocked")
+        if (
+            st.session_state.get("run_judge")
+            and st.session_state.get("judge")
+            and not was_refused
+        ):
+            try:
+                judge_result = await st.session_state.judge.evaluate(
+                    query=query,
+                    response=result.get("response", ""),
+                    sources=result_meta.get("research_findings", []),
+                )
+            except Exception as exc:
+                judge_result = {"error": str(exc)}
         
         # Extract citations from conversation history
         citations = extract_citations(result)
@@ -94,7 +128,13 @@ async def process_query(query: str) -> Dict[str, Any]:
         metadata["agent_traces"] = agent_traces
         metadata["citations"] = citations
         metadata["critique_score"] = calculate_quality_score(result)
-        
+        # safety information is already nested under metadata["safety"] by
+        # the orchestrator; surface it for the UI helpers below.
+        metadata["safety_events"] = (metadata.get("safety", {}) or {}).get(
+            "events", []
+        )
+        metadata["judge"] = judge_result
+
         return {
             "query": query,
             "response": result.get("response", ""),
@@ -119,11 +159,14 @@ def extract_citations(result: Dict[str, Any]) -> list:
     # Look through conversation history for citations
     for msg in result.get("conversation_history", []):
         content = msg.get("content", "")
-        
+        # Tool-call entries are lists of dicts; flatten to a string.
+        if not isinstance(content, str):
+            content = str(content)
+
         # Find URLs in content
         import re
         urls = re.findall(r'https?://[^\s<>"{}|\\^`\[\]]+', content)
-        
+
         # Find citation patterns like [Source: Title]
         citation_patterns = re.findall(r'\[Source: ([^\]]+)\]', content)
         
@@ -144,7 +187,10 @@ def extract_agent_traces(result: Dict[str, Any]) -> Dict[str, list]:
     
     for msg in result.get("conversation_history", []):
         agent = msg.get("source", "Unknown")
-        content = msg.get("content", "")[:200]  # First 200 chars
+        content = msg.get("content", "")
+        if not isinstance(content, str):
+            content = str(content)
+        content = content[:200]  # First 200 chars
         
         if agent not in traces:
             traces[agent] = []
@@ -193,6 +239,32 @@ def display_response(result: Dict[str, Any]):
         st.error(f"Error: {result['error']}")
         return
 
+    metadata = result.get("metadata", {})
+    safety = metadata.get("safety", {}) or {}
+    input_check = safety.get("input") or {}
+    output_check = safety.get("output") or {}
+
+    # Strong banner for blocked input.
+    if input_check.get("blocked"):
+        st.error(
+            "Input blocked by a safety policy. "
+            f"Triggered categories: {', '.join({v.get('category','?') for v in input_check.get('violations', [])})}"
+        )
+        st.markdown(input_check.get("message") or result.get("response", ""))
+        with st.expander("Input violation details", expanded=True):
+            for v in input_check.get("violations", []):
+                st.warning(
+                    f"[{v.get('severity','low').upper()}] {v.get('category','?')}: {v.get('reason','')}"
+                )
+        return
+
+    # Banner if output was refused or sanitized.
+    action = output_check.get("action", "allow")
+    if action == "refuse":
+        st.error("Output refused by the safety policy.")
+    elif action == "sanitize":
+        st.warning("Output was sanitized (PII or unsafe spans redacted).")
+
     # Display response
     st.markdown("### Response")
     response = result.get("response", "")
@@ -206,7 +278,6 @@ def display_response(result: Dict[str, Any]):
                 st.markdown(f"**[{i}]** {citation}")
 
     # Display metadata
-    metadata = result.get("metadata", {})
     col1, col2 = st.columns(2)
     with col1:
         st.metric("Sources Used", metadata.get("num_sources", 0))
@@ -217,23 +288,64 @@ def display_response(result: Dict[str, Any]):
     # Safety events
     safety_events = metadata.get("safety_events", [])
     if safety_events:
-        with st.expander("⚠️ Safety Events", expanded=True):
+        with st.expander(f"Safety Events ({len(safety_events)})", expanded=True):
             for event in safety_events:
                 event_type = event.get("type", "unknown")
-                action = event.get("action", "allow")
+                event_action = event.get("action", "allow")
                 violations = event.get("violations", [])
                 st.warning(
-                    f"{event_type.upper()} ({action.upper()}): "
-                    f"{len(violations)} violation(s) detected"
+                    f"{event_type.upper()} - action={event_action.upper()} - "
+                    f"{len(violations)} violation(s)"
                 )
                 for violation in violations:
-                    st.text(f"  • {violation.get('reason', 'Unknown')}")
+                    st.text(
+                        f"  [{violation.get('severity','low').upper()}] "
+                        f"{violation.get('category','?')}: "
+                        f"{violation.get('reason','')}"
+                    )
+
+    # LLM-as-a-Judge scores
+    judge_result = metadata.get("judge")
+    if judge_result and not judge_result.get("error"):
+        display_judge_result(judge_result)
+    elif judge_result and judge_result.get("error"):
+        st.warning(f"Judge error: {judge_result['error']}")
 
     # Agent traces
     if st.session_state.show_traces:
         agent_traces = metadata.get("agent_traces", {})
         if agent_traces:
             display_agent_traces(agent_traces)
+
+
+def display_judge_result(judge_result: Dict[str, Any]):
+    """Render the LLM-as-a-Judge evaluation result."""
+    st.markdown("### LLM-as-a-Judge Evaluation")
+    overall = judge_result.get("overall_score", 0.0)
+    st.metric("Overall Weighted Score", f"{overall:.3f}")
+
+    perspective_scores = judge_result.get("perspective_scores", {}) or {}
+    if perspective_scores:
+        cols = st.columns(len(perspective_scores))
+        for col, (name, score) in zip(cols, perspective_scores.items()):
+            col.metric(name.replace("_", " ").title(), f"{score:.3f}")
+
+    criterion_scores = judge_result.get("criterion_scores", {}) or {}
+    if criterion_scores:
+        rows = []
+        for crit, data in criterion_scores.items():
+            perspectives = data.get("perspectives", {})
+            row = {"criterion": crit, "average": round(data.get("score", 0.0), 3)}
+            for p_name, p_data in perspectives.items():
+                row[p_name] = round(p_data.get("score", 0.0), 3)
+            rows.append(row)
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+        with st.expander("Judge reasoning (per perspective × criterion)", expanded=False):
+            for crit, data in criterion_scores.items():
+                st.markdown(f"**{crit}**  —  average {data.get('score', 0.0):.3f}")
+                for p_name, p_data in data.get("perspectives", {}).items():
+                    st.markdown(f"- *{p_name}* `{p_data.get('score', 0.0):.2f}` — {p_data.get('reasoning','')}")
 
 
 def display_agent_traces(traces: Dict[str, Any]):
@@ -271,13 +383,25 @@ def display_sidebar():
             value=st.session_state.show_safety_log
         )
 
+        # Run LLM-as-a-Judge after each query
+        st.session_state.run_judge = st.checkbox(
+            "Run LLM-as-a-Judge",
+            value=st.session_state.run_judge,
+            help="Score the response with two independent rubrics (supportive + strict).",
+        )
+
         st.divider()
 
         st.title("📊 Statistics")
 
-        # TODO: Get actual statistics
         st.metric("Total Queries", len(st.session_state.history))
-        st.metric("Safety Events", 0)  # TODO: Get from safety manager
+
+        # Sum safety events across queries.
+        total_events = 0
+        for item in st.session_state.history:
+            md = (item.get("result", {}) or {}).get("metadata", {}) or {}
+            total_events += len(md.get("safety_events", []) or [])
+        st.metric("Safety Events", total_events)
 
         st.divider()
 
@@ -336,6 +460,40 @@ def main():
             placeholder="e.g., What are the latest developments in explainable AI for novice users?"
         )
 
+        # "Load demo session" — display a saved live run without re-running it.
+        # Useful for graders / screenshots when API keys are unavailable.
+        demo_paths = sorted(Path("outputs").glob("session_*.json"), reverse=True)
+        if demo_paths:
+            if st.button("📂 Load most recent demo session", use_container_width=True):
+                try:
+                    with open(demo_paths[0]) as f:
+                        saved = json.load(f)
+                    metadata = saved.get("metadata", {}) or {}
+                    citations = extract_citations(saved)
+                    metadata["agent_traces"] = extract_agent_traces(saved)
+                    metadata["citations"] = citations
+                    metadata["critique_score"] = calculate_quality_score(saved)
+                    metadata["safety_events"] = (
+                        (metadata.get("safety") or {}).get("events", [])
+                    )
+                    # If the session was exported with a judge field, surface it.
+                    metadata["judge"] = saved.get("judge")
+                    loaded_result = {
+                        "query": saved.get("query", ""),
+                        "response": saved.get("response", ""),
+                        "citations": citations,
+                        "metadata": metadata,
+                    }
+                    st.session_state.history.append({
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "query": loaded_result["query"],
+                        "result": loaded_result,
+                    })
+                    st.session_state.preview_result = loaded_result
+                    st.success(f"Loaded {demo_paths[0].name}")
+                except Exception as exc:
+                    st.error(f"Could not load demo session: {exc}")
+
         # Submit button
         if st.button("🔍 Search", type="primary", use_container_width=True):
             if query.strip():
@@ -355,6 +513,11 @@ def main():
                     display_response(result)
             else:
                 st.warning("Please enter a query.")
+
+        # If a session was loaded via "Load demo session", display it here.
+        if st.session_state.get("preview_result"):
+            st.divider()
+            display_response(st.session_state.preview_result)
 
         # History
         display_history()
@@ -392,9 +555,25 @@ def main():
     # Safety log (if enabled)
     if st.session_state.show_safety_log:
         st.divider()
-        st.markdown("### 🛡️ Safety Event Log")
-        # TODO: Display safety events from safety manager
-        st.info("No safety events recorded.")
+        st.markdown("### Safety Event Log")
+        all_events = []
+        for item in st.session_state.history:
+            md = (item.get("result", {}) or {}).get("metadata", {}) or {}
+            all_events.extend(md.get("safety_events", []) or [])
+        if not all_events:
+            st.info("No safety events recorded.")
+        else:
+            for event in all_events[-50:]:
+                st.warning(
+                    f"[{event.get('timestamp','')}] {event.get('type','?').upper()} "
+                    f"- action={event.get('action','?').upper()} - "
+                    f"{len(event.get('violations', []))} violation(s)"
+                )
+                for v in event.get("violations", []):
+                    st.text(
+                        f"  [{v.get('severity','low').upper()}] "
+                        f"{v.get('category','?')}: {v.get('reason','')}"
+                    )
 
 
 if __name__ == "__main__":

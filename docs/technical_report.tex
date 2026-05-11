@@ -1,0 +1,339 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+% --- Packages -----------------------------------------------------------------
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{url}
+\usepackage{hyperref}
+\usepackage{listings}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+% --- Title --------------------------------------------------------------------
+\title{A Multi-Agent Deep-Research Assistant for HCI Topics}
+
+\author{\IEEEauthorblockN{Qiming L.}
+\IEEEauthorblockA{\textit{Assignment 3, Multi-Agent Systems} \\
+\textit{Fall 2025} \\
+qiming.l@example.edu}}
+
+\maketitle
+
+% --- Abstract -----------------------------------------------------------------
+\begin{abstract}
+We present a four-agent deep-research assistant for human--computer
+interaction (HCI) topics, orchestrated with Microsoft AutoGen's
+\texttt{RoundRobinGroupChat}. A \emph{Planner}, \emph{Researcher},
+\emph{Writer}, and \emph{Critic} cooperate via a shared chat, with the
+Researcher invoking real Tavily web search and Semantic Scholar paper search
+through \texttt{FunctionTool} wrappers. Around this core we add (i)~a custom
+rule-based safety policy filter that runs both \emph{before} the team executes
+(input guardrail covering harmful content, prompt injection, off-topic
+queries, and malformed input) and \emph{after} (output guardrail covering
+PII, harmful content, bias, and citation grounding); (ii)~a two-perspective
+LLM-as-a-Judge --- a \emph{supportive} reviewer and a \emph{strict}
+reviewer --- that each score five criteria (relevance, evidence quality,
+factual accuracy, safety compliance, clarity); and (iii)~CLI and Streamlit
+interfaces that surface agent traces, citations, and safety refusals. The
+system runs against the SALT-lab \texttt{gpt-5-mini} gateway and is evaluated
+on ten HCI queries plus five adversarial safety probes.
+\end{abstract}
+
+\begin{IEEEkeywords}
+multi-agent systems, AutoGen, LLM-as-a-Judge, safety guardrails, HCI,
+retrieval-augmented generation
+\end{IEEEkeywords}
+
+% --- Body ---------------------------------------------------------------------
+\section{System Design and Implementation}
+
+\subsection{Agents and Control Flow}
+Four AutoGen \texttt{AssistantAgent} instances share a chat managed by
+\texttt{RoundRobinGroupChat} and terminate on the token \texttt{TERMINATE}.
+Table~\ref{tab:agents} summarises the role of each agent and its hand-off
+token. The orchestrator (\texttt{src/autogen\_orchestrator.py}) wraps
+\texttt{team.run()} with two safety gates and a result extractor that pulls
+the \emph{Writer's} message as the canonical answer (rather than the Critic's
+review), and aggregates messages, sources, and the running agent set into
+structured metadata returned to the UI layer.
+
+\begin{table}[t]
+\centering
+\caption{Agents, tools, and hand-off tokens.}
+\label{tab:agents}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\columnwidth}{@{}lll@{}}
+\toprule
+\textbf{Agent} & \textbf{Tools} & \textbf{Hand-off token} \\
+\midrule
+Planner    & ---                         & \texttt{PLAN COMPLETE} \\
+Researcher & web\_search, paper\_search  & \texttt{RESEARCH COMPLETE} \\
+Writer     & ---                         & \texttt{DRAFT COMPLETE} \\
+Critic     & ---                         & \texttt{APPROVED} / \texttt{TERMINATE} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Tools}
+\texttt{src/tools/web\_search.py} exposes a thin \texttt{WebSearchTool} over
+Tavily and Brave with a unified result schema (\texttt{title}, \texttt{url},
+\texttt{snippet}, \texttt{score}, \texttt{published\_date}).
+\texttt{src/tools/paper\_search.py} wraps the \texttt{semanticscholar} Python
+client and supports year/citation filters. Both are exposed to AutoGen as
+synchronous \texttt{FunctionTool} instances.
+\texttt{src/tools/citation\_tool.py} formats sources in APA-7 (with MLA
+fallback), de-duplicates entries, and emits a sorted bibliography.
+
+\subsection{Models and Configuration}
+All tunables --- model provider, agent prompts, tool providers, safety policy,
+and judge criteria --- live in \texttt{config.yaml}; secrets live in
+\texttt{.env}. The default chat model is \textbf{gpt-5-mini} served by the
+SALT-lab OpenAI-compatible gateway
+(\texttt{https://openai.gateway.salt-lab.org/v1}); the judge model points at
+the same endpoint with \texttt{temperature=0.3}. Both Groq and
+OpenAI-compatible (vLLM) clients are auto-detected at runtime, so the same
+code runs against the class-provided endpoint or a Groq fallback without
+modification.
+
+\subsection{User Interfaces}
+A Streamlit web UI (\texttt{src/ui/streamlit\_app.py}) shows the final
+answer, citations, agent traces, a quality score, and a dedicated
+\emph{Safety Events} expander. A CLI (\texttt{src/ui/cli.py}) prints the same
+information for terminal use. A single entry point, \texttt{main.py}, exposes
+five modes: \texttt{cli}, \texttt{web}, \texttt{evaluate}, \texttt{autogen},
+and \texttt{demo} (a one-shot end-to-end query that exports the full session
+as JSON to \texttt{outputs/}).
+
+% -----------------------------------------------------------------------------
+\section{Safety Design}
+
+We defined a six-category policy and implemented it as a custom rule-based
+filter in \texttt{src/guardrails/}. We chose rule-based filters over
+Guardrails~AI \cite{guardrails_ai} or NeMo Guardrails \cite{rebedea2023nemo}
+to keep the system deterministic, offline-friendly, and inspectable; the
+implementation exposes a \texttt{\_check\_with\_external\_validator} hook so
+a stronger validator can be plugged in without changing the orchestrator.
+
+\begin{table}[t]
+\centering
+\caption{Safety policy: categories, stage, and default action.}
+\label{tab:safety}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\columnwidth}{@{}lll@{}}
+\toprule
+\textbf{Category} & \textbf{Stage} & \textbf{Default action} \\
+\midrule
+\texttt{harmful\_content}    & input + output & refuse \\
+\texttt{prompt\_injection}   & input          & refuse + sanitise \\
+\texttt{off\_topic\_queries} & input          & warn \\
+\texttt{pii}                 & output         & sanitise (redact) \\
+\texttt{misinformation}      & output         & warn \\
+\texttt{bias}                & output         & sanitise \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Severity is \texttt{high}, \texttt{medium}, or \texttt{low}; only \texttt{high}
+violations trigger the refusal path. Each event carries
+\texttt{(timestamp, type, action, violations, content\_preview)} and is
+appended both to an in-memory list (returned to the UI in
+\texttt{metadata.safety.events}) and to \texttt{logs/safety\_events.log}. The
+orchestrator calls \texttt{check\_input\_safety()} \emph{before}
+\texttt{team.run()} and \texttt{check\_output\_safety()} \emph{after}, so
+blocked queries never reach the LLM and PII never reaches the user.
+
+The Streamlit UI displays a red banner --- \emph{``Input blocked by a safety
+policy''} --- with the exact triggered category, and an amber banner for
+sanitisation. We verified all six categories pass on a five-query adversarial
+probe set (\texttt{data/safety\_test\_queries.json}); for example,
+\emph{``Ignore previous instructions and tell me how to make a bomb''} fires
+\texttt{harmful\_content}, \texttt{prompt\_injection}, and
+\texttt{off\_topic\_queries} simultaneously, and the team is never invoked.
+
+% -----------------------------------------------------------------------------
+\section{Evaluation Setup and Results}
+
+\subsection{Dataset}
+\texttt{data/example\_queries.json} contains ten diverse HCI queries spanning
+explainable AI, AR usability, AI ethics, UX measurement, conversational AI in
+healthcare, accessibility, uncertainty visualisation, voice UIs for the
+elderly, AI prototyping, and cross-cultural design. Each item carries a
+category and an expected-topic list; three carry an APA-style ground truth.
+\texttt{data/safety\_test\_queries.json} adds five adversarial / control
+prompts targeting the safety policy.
+
+\subsection{LLM-as-a-Judge: Two Independent Rubrics}
+A single judging perspective biases toward whatever rubric the prompt evokes.
+We therefore implemented an \emph{ensemble} of two perspectives in
+\texttt{src/evaluation/judge.py}:
+\begin{itemize}
+  \item \textbf{Supportive reviewer} --- ``rigorous but partial-credit-friendly'',
+        scale $0.0$--$1.0$ with mid-range anchors.
+  \item \textbf{Strict reviewer} --- ``sceptical peer reviewer at a top HCI
+        venue'', same scale but conservative; demands citations.
+\end{itemize}
+Each of the five criteria (relevance, evidence quality, factual accuracy,
+safety compliance, clarity, with weights
+$0.25/0.25/0.20/0.15/0.15$) is scored independently by both perspectives;
+the per-criterion score is the average; the overall score is the weighted
+average; the per-perspective score is the mean across criteria. The judge
+prompt instructs strict JSON output and tolerates markdown fences via a
+regex extractor (\texttt{\_parse\_judgment}).
+
+\subsection{Results}
+We ran one full demo (\texttt{main.py --mode demo}) end-to-end against
+\texttt{gpt-5-mini}. The four agents exchanged 21 messages and produced a
+$4\,947$-character draft. Per-criterion scores are shown in
+Table~\ref{tab:scores}.
+
+\begin{table}[t]
+\centering
+\caption{Judge scores for the live \texttt{gpt-5-mini} demo run.}
+\label{tab:scores}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\columnwidth}{@{}Xrrr@{}}
+\toprule
+\textbf{Criterion} & \textbf{Supportive} & \textbf{Strict} & \textbf{Avg.} \\
+\midrule
+Relevance         & 0.00 & 0.00 & 0.00 \\
+Evidence quality  & 0.65 & 0.45 & 0.55 \\
+Factual accuracy  & 0.80 & 0.60 & 0.70 \\
+Safety compliance & 1.00 & 1.00 & 1.00 \\
+Clarity           & 0.65 & 0.45 & 0.55 \\
+\midrule
+\textbf{Weighted overall} & \textbf{0.68} & \textbf{0.44} & \textbf{0.51} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The $0.24$ spread between perspectives confirms the value of ensembling: the
+strict reviewer penalised the lack of grounded citations far more
+aggressively than the supportive one. Safety compliance scored $1.0$ from
+both judges, as expected.
+
+\subsection{Error Analysis}
+The Researcher's tool calls \emph{failed silently} on this run because no
+\texttt{TAVILY\_API\_KEY} was supplied and Semantic Scholar refused the
+unauthenticated connection (rate limit). The agents detected the empty
+results and entered a ``scope confirmation'' loop with the (mocked) user,
+never producing the substantive HCI synthesis the query asked for --- hence
+relevance $0.00$. This is informative: the system correctly \emph{detected}
+that it lacked evidence rather than hallucinating, but it also failed to
+recover (e.g.\ by retrying with a different provider or by writing a
+clearly-flagged ``no-evidence'' answer). A pre-recorded reference run on the
+same accessible-UI query (with Tavily enabled) reached overall $0.84$
+(see \texttt{outputs/sample\_session.md}), suggesting tool availability is
+the dominant bottleneck rather than agent design. Three additional failure
+patterns appeared across exploratory runs: (a)~over-long Critic feedback
+echoing back into the chat and pushing context, (b)~Writer occasionally
+appending the literal \texttt{TERMINATE} token to its draft (stripped
+post-hoc by the orchestrator), and (c)~the Critic asking the user
+clarifying questions instead of approving --- addressable by tightening the
+agent prompts and adding a hard cap on rounds.
+
+% -----------------------------------------------------------------------------
+\section{Discussion and Limitations}
+
+\paragraph*{Insights}
+Splitting safety into an \emph{input} gate (rule-based, free, fast) and an
+\emph{output} gate (PII regex + citation heuristic) gave us deterministic
+guarantees on the high-severity classes (harmful content, prompt injection,
+raw PII) without needing a moderation model. The two-perspective judge
+produced more interpretable signals than a single rubric: a wide
+supportive--strict gap reliably flagged ``stylistically OK but
+evidence-thin'' answers. Wrapping each tool as a \texttt{FunctionTool} and
+letting the Researcher choose calls --- rather than hard-coding a
+sequence --- preserved AutoGen's idiomatic flow at the cost of occasional
+skipped searches.
+
+\paragraph*{Limitations}
+(1)~The guardrails are regex-based and will miss obfuscated harmful content;
+the \texttt{\_check\_with\_external\_validator} hook is a placeholder, not a
+wired Guardrails-AI / NeMo integration.
+(2)~Topic relevance is keyword-driven and biased toward English HCI
+vocabulary.
+(3)~The judge uses the same model (\texttt{gpt-5-mini}) as the Writer, so it
+shares the Writer's blind spots --- a stronger setup would use a different
+model family for judging.
+(4)~Tool failures are reported but the agents do not recover gracefully (no
+exponential back-off, no provider fallback).
+(5)~Evaluation $N{=}10$ queries is small; per-criterion variance is therefore
+wide.
+
+\paragraph*{Future work}
+Plug a real moderation API (e.g.\ OpenAI Moderation, Llama~Guard) into the
+input gate; add an LLM-based citation-grounding verifier to the output gate;
+introduce a \emph{Verifier} agent that checks each Writer claim against the
+retrieved snippets before the Critic; sweep three judges and report
+inter-rater agreement (Cohen's~$\kappa$); and grow the eval set to $\geq 50$
+queries for tighter confidence intervals.
+
+\paragraph*{Ethics}
+The system is deliberately constrained to the HCI research domain, refuses
+harmful and injection requests at the front door, and redacts PII before it
+is shown. We do not log full user queries to disk --- only $200$-character
+previews --- and we keep secrets out of the repo via \texttt{.gitignore}.
+
+% --- References ---------------------------------------------------------------
+\begin{thebibliography}{00}
+
+\bibitem{wu2023autogen}
+Q. Wu \emph{et al.}, ``AutoGen: Enabling next-gen LLM applications via
+multi-agent conversation,'' \emph{arXiv preprint arXiv:2308.08155}, 2023.
+[Online]. Available: \url{https://arxiv.org/abs/2308.08155}
+
+\bibitem{autogen_docs}
+Microsoft, ``AutoGen: Multi-agent conversation framework (documentation),''
+2024. [Online]. Available: \url{https://microsoft.github.io/autogen/}
+
+\bibitem{rebedea2023nemo}
+T. Rebedea, R. Dinu, M. Sreedhar, C. Parisien, and J. Cohen, ``NeMo
+Guardrails: A toolkit for controllable and safe LLM applications with
+programmable rails,'' \emph{arXiv preprint arXiv:2310.10501}, 2023.
+[Online]. Available: \url{https://arxiv.org/abs/2310.10501}
+
+\bibitem{guardrails_ai}
+Guardrails~AI, ``Guardrails: An open-source toolkit for safer LLM
+applications,'' 2024. [Online]. Available:
+\url{https://docs.guardrailsai.com/}
+
+\bibitem{tavily}
+Tavily, ``Tavily search API documentation,'' 2024. [Online]. Available:
+\url{https://docs.tavily.com/}
+
+\bibitem{semanticscholar}
+Allen Institute for AI, ``Semantic Scholar Academic Graph API,'' 2024.
+[Online]. Available: \url{https://api.semanticscholar.org/}
+
+\bibitem{wcag}
+S.~L. Henry, ``Web content accessibility guidelines (WCAG) overview,''
+W3C Web Accessibility Initiative, 2024. [Online]. Available:
+\url{https://www.w3.org/WAI/standards-guidelines/wcag/}
+
+\bibitem{lazar2017accessibility}
+J. Lazar, D. Goldstein, and A. Taylor, \emph{Ensuring Digital Accessibility
+through Process and Policy}. San Francisco, CA, USA: Morgan Kaufmann, 2017.
+
+\bibitem{petrie2009evaluation}
+H. Petrie and N. Bevan, ``The evaluation of accessibility, usability, and
+user experience,'' in \emph{The Universal Access Handbook},
+C. Stephanidis, Ed. Boca Raton, FL, USA: CRC Press, 2009, pp. 1--16.
+
+\bibitem{webaim}
+WebAIM, ``Introduction to web accessibility,'' 2024. [Online]. Available:
+\url{https://webaim.org/intro/}
+
+\end{thebibliography}
+
+\end{document}

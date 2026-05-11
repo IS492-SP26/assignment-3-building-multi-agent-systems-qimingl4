@@ -1,107 +1,164 @@
 """
 Safety Manager
-Coordinates safety guardrails and logs safety events.
+Coordinates input/output guardrails and logs safety events.
+
+Policy categories (defined in config.yaml under safety.prohibited_categories):
+  - harmful_content     : explicit violence / illegal-activity requests
+  - prompt_injection    : attempts to override system instructions
+  - off_topic_queries   : queries outside the configured research topic
+  - pii                 : output contains personal identifiable information
+  - misinformation      : long assertive claims with no citations
+  - bias                : blanket discriminatory generalisations
+
+Response strategies (config.yaml -> safety.on_violation.action):
+  - "refuse"   : replace the response with a refusal message (default)
+  - "sanitize" : strip violating spans / redact PII, return sanitized output
+  - "redirect" : refuse and suggest the user reformulate
 """
 
 from typing import Dict, Any, List, Optional
 import logging
 from datetime import datetime
 import json
+import os
+from pathlib import Path
+
+from .input_guardrail import InputGuardrail
+from .output_guardrail import OutputGuardrail
+
+
+REFUSAL_TEMPLATES = {
+    "harmful_content": (
+        "I cannot help with that request because it appears to involve "
+        "harmful or illegal content. Please rephrase your question to focus "
+        "on the research topic."
+    ),
+    "prompt_injection": (
+        "I detected an attempt to override the system's instructions. "
+        "I will continue to follow my original research-assistant role."
+    ),
+    "off_topic_queries": (
+        "Your query appears to be outside this assistant's scope "
+        "(HCI / UX / AI research). Try rephrasing to focus on a research topic."
+    ),
+    "pii": (
+        "The generated response contained personal identifiable information "
+        "and has been redacted before being shown."
+    ),
+    "misinformation": (
+        "The generated response made claims that could not be grounded in any "
+        "retrieved source. The response has been withheld."
+    ),
+    "bias": (
+        "The generated response contained biased generalisations that have "
+        "been removed before being shown."
+    ),
+    "default": "I cannot provide this response due to safety policies.",
+}
 
 
 class SafetyManager:
-    """
-    Manages safety guardrails for the multi-agent system.
-
-    TODO: YOUR CODE HERE
-    - Integrate with Guardrails AI or NeMo Guardrails
-    - Define safety policies
-    - Implement logging of safety events
-    - Handle different violation types with appropriate responses
-    """
+    """Manages safety guardrails for the multi-agent system."""
 
     def __init__(self, config: Dict[str, Any]):
         """
         Initialize safety manager.
 
         Args:
-            config: Safety configuration
+            config: Top-level config dictionary (config.yaml).
         """
         self.config = config
-        self.enabled = config.get("enabled", True)
-        self.log_events = config.get("log_events", True)
+        safety_cfg = config.get("safety", {}) if isinstance(config, dict) else {}
+        logging_cfg = config.get("logging", {}) if isinstance(config, dict) else {}
+
+        self.enabled = safety_cfg.get("enabled", True)
+        self.log_events = safety_cfg.get("log_events", True)
         self.logger = logging.getLogger("safety")
 
-        # Safety event log
-        self.safety_events: List[Dict[str, Any]] = []
-
-        # Prohibited categories
-        self.prohibited_categories = config.get("prohibited_categories", [
+        self.prohibited_categories = safety_cfg.get("prohibited_categories", [
             "harmful_content",
-            "personal_attacks",
+            "prompt_injection",
+            "off_topic_queries",
+            "pii",
             "misinformation",
-            "off_topic_queries"
+            "bias",
         ])
 
-        # Violation response strategy
-        self.on_violation = config.get("on_violation", {})
+        self.on_violation = safety_cfg.get("on_violation", {})
+        self.default_action = self.on_violation.get("action", "refuse")
+        self.refusal_message = self.on_violation.get(
+            "message", REFUSAL_TEMPLATES["default"]
+        )
 
-        # TODO: Initialize guardrail framework
-        # Suggested implementation:
-        # - Initialize InputGuardrail and OutputGuardrail instances here
-        # - Read safety_log path from config
-        # - Decide how refusal, sanitization, or redirect actions should be handled
+        # Sub-guardrails
+        self.input_guardrail = InputGuardrail(config)
+        self.output_guardrail = OutputGuardrail(config)
 
+        # In-memory log
+        self.safety_events: List[Dict[str, Any]] = []
+
+        # Persistent safety-event log file
+        self.safety_log_file = logging_cfg.get("safety_log") or safety_cfg.get(
+            "safety_log_file"
+        )
+        if self.safety_log_file:
+            try:
+                Path(self.safety_log_file).parent.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                self.logger.error(f"Could not create safety log directory: {exc}")
+
+    # ------------------------------------------------------------------ inputs
     def check_input_safety(self, query: str) -> Dict[str, Any]:
         """
         Check if input query is safe to process.
 
-        Args:
-            query: User query to check
-
         Returns:
-            Dictionary with 'safe' boolean and optional 'violations' list
-
-        TODO: YOUR CODE HERE
-        - Implement guardrail checks
-        - Detect harmful/inappropriate content
-        - Detect off-topic queries
-        - Return detailed violation information
+            {
+              "safe": bool,
+              "blocked": bool,
+              "action": "allow" | "refuse" | "sanitize" | "redirect",
+              "query": str,           # possibly sanitized
+              "violations": List[dict],
+              "message": Optional[str],   # refusal message for the UI
+            }
         """
         if not self.enabled:
-            return {"safe": True}
+            return {"safe": True, "blocked": False, "action": "allow", "query": query, "violations": []}
 
-        # TODO: Implement actual safety checks
-        # Suggested implementation:
-        # - Call InputGuardrail.validate(query)
-        # - Use config.on_violation to decide whether to refuse or sanitize
-        # - Log safety events via _log_safety_event()
-        # - Return safe/query/violations/action fields for the UI layer
+        result = self.input_guardrail.validate(query)
+        violations = result["violations"]
+        blocked = result["blocked"]
 
-        # Placeholder implementation with simple keyword checks
-        violations = []
+        action = "allow"
+        message = None
+        sanitized_query = result.get("sanitized_input", query)
 
-        # Check for prohibited keywords (very basic example)
-        prohibited_keywords = ["hack", "attack", "exploit", "bypass"]
-        for keyword in prohibited_keywords:
-            if keyword.lower() in query.lower():
-                violations.append({
-                    "category": "potentially_harmful",
-                    "reason": f"Query contains prohibited keyword: {keyword}",
-                    "severity": "medium"
-                })
+        if blocked:
+            action = self.default_action
+            top_category = self._top_violation_category(violations)
+            message = REFUSAL_TEMPLATES.get(top_category, self.refusal_message)
+        elif violations:
+            # Non-blocking: warn-only.
+            action = "warn"
 
-        is_safe = len(violations) == 0
-
-        # Log safety event
-        if not is_safe and self.log_events:
-            self._log_safety_event("input", query, violations, is_safe)
+        if violations and self.log_events:
+            self._log_safety_event(
+                event_type="input",
+                content=query,
+                violations=violations,
+                action=action,
+            )
 
         return {
-            "safe": is_safe,
+            "safe": not blocked,
+            "blocked": blocked,
+            "action": action,
+            "query": sanitized_query,
             "violations": violations,
+            "message": message,
         }
 
+    # ----------------------------------------------------------------- outputs
     def check_output_safety(
         self,
         response: str,
@@ -110,127 +167,126 @@ class SafetyManager:
         """
         Check if output response is safe to return.
 
-        Args:
-            response: Generated response to check
-            sources: Optional source metadata used by output validation
-
         Returns:
-            Dictionary with 'safe' boolean and optional 'violations' list
-
-        TODO: YOUR CODE HERE
-        - Implement output guardrail checks
-        - Detect harmful content in responses
-        - Detect potential misinformation
-        - Sanitize or redact unsafe content
+            {
+              "safe": bool,
+              "blocked": bool,
+              "action": "allow" | "refuse" | "sanitize" | "redirect",
+              "response": str,
+              "violations": List[dict],
+              "message": Optional[str],
+            }
         """
         if not self.enabled:
-            return {"safe": True, "response": response}
+            return {"safe": True, "blocked": False, "action": "allow", "response": response, "violations": []}
 
-        # TODO: Implement actual output safety checks
-        # Suggested implementation:
-        # - Call OutputGuardrail.validate(response, sources)
-        # - Decide whether to return the raw, sanitized, or refused response
-        # - Attach violations and action metadata so the UI can display them
+        result = self.output_guardrail.validate(response, sources)
+        violations = result["violations"]
+        blocked = result["blocked"]
 
-        violations = []
+        action = "allow"
+        message = None
+        final_response = response
 
-        # Placeholder implementation
-        is_safe = len(violations) == 0
+        if blocked:
+            # Severe: refuse outright.
+            action = "refuse"
+            top_category = self._top_violation_category(violations)
+            message = REFUSAL_TEMPLATES.get(top_category, self.refusal_message)
+            final_response = message
+        elif violations:
+            # Non-blocking: sanitize (e.g. PII redaction, soft warnings).
+            action = "sanitize"
+            final_response = result.get("sanitized_output", response)
+            top_category = self._top_violation_category(violations)
+            message = REFUSAL_TEMPLATES.get(top_category, None)
 
-        # Log safety event
-        if not is_safe and self.log_events:
-            self._log_safety_event("output", response, violations, is_safe)
+        if violations and self.log_events:
+            self._log_safety_event(
+                event_type="output",
+                content=response,
+                violations=violations,
+                action=action,
+            )
 
-        result = {
-            "safe": is_safe,
+        return {
+            "safe": not blocked,
+            "blocked": blocked,
+            "action": action,
+            "response": final_response,
             "violations": violations,
-            "response": response
+            "message": message,
         }
 
-        # Apply sanitization if configured
-        if not is_safe:
-            action = self.on_violation.get("action", "refuse")
-            if action == "sanitize":
-                result["response"] = self._sanitize_response(response, violations)
-            elif action == "refuse":
-                result["response"] = self.on_violation.get(
-                    "message",
-                    "I cannot provide this response due to safety policies."
-                )
-
-        return result
-
-    def _sanitize_response(self, response: str, violations: List[Dict[str, Any]]) -> str:
-        """
-        Sanitize response by removing or redacting unsafe content.
-        """
-        # TODO: YOUR CODE HERE
-        # Suggested implementation:
-        # - Redact PII or unsafe spans
-        # - Replace severe outputs with a refusal message
-        # - Preserve enough information for the user to know what happened
-        return "[REDACTED] " + response
+    # ------------------------------------------------------------- bookkeeping
+    @staticmethod
+    def _top_violation_category(violations: List[Dict[str, Any]]) -> str:
+        """Pick the most severe violation's category for messaging."""
+        order = {"high": 0, "medium": 1, "low": 2}
+        violations_sorted = sorted(
+            violations,
+            key=lambda v: order.get(v.get("severity", "low"), 99),
+        )
+        if not violations_sorted:
+            return "default"
+        return violations_sorted[0].get("category", "default")
 
     def _log_safety_event(
         self,
         event_type: str,
         content: str,
         violations: List[Dict[str, Any]],
-        is_safe: bool
+        action: str,
     ):
-        """
-        Log a safety event.
-
-        Args:
-            event_type: "input" or "output"
-            content: The content that was checked
-            violations: List of violations found
-            is_safe: Whether content passed safety checks
-        """
+        """Append an event to the in-memory log and to disk."""
         event = {
             "timestamp": datetime.now().isoformat(),
             "type": event_type,
-            "safe": is_safe,
+            "action": action,
             "violations": violations,
-            "content_preview": content[:100] + "..." if len(content) > 100 else content
+            "content_preview": (content[:200] + "...") if len(content) > 200 else content,
         }
-
         self.safety_events.append(event)
-        self.logger.warning(f"Safety event: {event_type} - safe={is_safe}")
 
-        # Write to safety log file if configured
-        log_file = self.config.get("safety_log_file")
-        if log_file and self.log_events:
-            try:
-                with open(log_file, "a") as f:
-                    f.write(json.dumps(event) + "\n")
-            except Exception as e:
-                self.logger.error(f"Failed to write safety log: {e}")
+        self.logger.warning(
+            f"Safety event: type={event_type} action={action} "
+            f"violations={len(violations)}"
+        )
+
+        if not self.safety_log_file:
+            return
+        try:
+            with open(self.safety_log_file, "a") as f:
+                f.write(json.dumps(event) + "\n")
+        except Exception as exc:
+            self.logger.error(f"Failed to write safety log: {exc}")
 
     def get_safety_events(self) -> List[Dict[str, Any]]:
-        """Get all logged safety events."""
-        return self.safety_events
+        """Return all recorded safety events."""
+        return list(self.safety_events)
 
     def get_safety_stats(self) -> Dict[str, Any]:
-        """
-        Get statistics about safety events.
-
-        Returns:
-            Dictionary with safety statistics
-        """
+        """Return aggregate statistics."""
         total = len(self.safety_events)
-        input_events = sum(1 for e in self.safety_events if e["type"] == "input")
-        output_events = sum(1 for e in self.safety_events if e["type"] == "output")
-        violations = sum(1 for e in self.safety_events if not e["safe"])
+        by_type = {"input": 0, "output": 0}
+        by_action = {}
+        by_category = {}
+
+        for e in self.safety_events:
+            by_type[e["type"]] = by_type.get(e["type"], 0) + 1
+            action = e.get("action", "unknown")
+            by_action[action] = by_action.get(action, 0) + 1
+            for v in e.get("violations", []):
+                cat = v.get("category", "unknown")
+                by_category[cat] = by_category.get(cat, 0) + 1
 
         return {
             "total_events": total,
-            "input_checks": input_events,
-            "output_checks": output_events,
-            "violations": violations,
-            "violation_rate": violations / total if total > 0 else 0
+            "by_type": by_type,
+            "by_action": by_action,
+            "by_category": by_category,
         }
 
     def clear_events(self):
-        """Clear safety event log."""
+        """Clear the in-memory log."""
         self.safety_events = []
